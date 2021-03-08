@@ -116,6 +116,10 @@ int SimExternalConnection::write(SendBuffer const* buffer, int limit) {
 	return bytesSent;
 }
 
+Future<int> SimExternalConnection::asyncWrite(SendBuffer const* buffer, int limit) {
+	return Future(0);
+}
+
 NetworkAddress SimExternalConnection::getPeerAddress() const {
 	auto endpoint = socket.remote_endpoint();
 	auto addr = endpoint.address();

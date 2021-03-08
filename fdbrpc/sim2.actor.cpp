@@ -253,6 +253,10 @@ struct Sim2Conn final : IConnection, ReferenceCounted<Sim2Conn> {
 		return toSend;
 	}
 
+	Future<int> asyncWrite(SendBuffer const* buffer, int limit) override {
+		return Future(0);
+	}
+
 	// Returns the network address and port of the other end of the connection.  In the case of an incoming connection, this may not
 	// be an address we can connect to!
 	NetworkAddress getPeerAddress() const override { return peerEndpoint; }

@@ -413,6 +413,8 @@ public:
 	// Due to limitations of TLSConnection, callers must also avoid reallocations that reduce the amount of written data in the first buffer in the chain.
 	virtual int write( SendBuffer const* buffer, int limit = std::numeric_limits<int>::max()) = 0;
 
+	virtual Future<int> asyncWrite( SendBuffer const* buffer, int limit = std::numeric_limits<int>::max() ) = 0;
+
 	// Returns the network address and port of the other end of the connection.  In the case of an incoming connection, this may not
 	// be an address we can connect to!
 	virtual NetworkAddress getPeerAddress() const = 0;

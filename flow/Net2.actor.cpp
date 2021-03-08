@@ -340,6 +340,63 @@ public:
 	}
 };
 
+class WritePromise {
+	Promise<int> p;
+	const char* errContext;
+	UID errID;
+	SendBuffer const* data;
+	int limit;
+	std::function<void()> closeSocket;
+
+public:
+	WritePromise(const char* errContext, UID errID, SendBuffer const* data, int limit, std::function<void()> closeSocket) 
+		: errContext(errContext)
+		, errID(errID)
+		, data(data)
+		, limit(limit)
+		, closeSocket(closeSocket) {}
+	WritePromise(WritePromise const& other) = default;
+	WritePromise(WritePromise&& other) 
+		: p(std::move(other.p))
+		, errContext(errContext)
+		, errID(errID)
+		, data(data)
+		, limit(limit)
+		, closeSocket(closeSocket) {}
+
+	Future<int> getFuture() { return p.getFuture(); }
+	void operator()(const boost::system::error_code& error, size_t bytesWritten) {
+		auto failed = false;
+		try {
+			if (error) {
+				TraceEvent evt(SevWarn, errContext, errID);
+				evt.suppressFor(1.0).detail("ErrorCode", error.value()).detail("Message", error.message());
+				failed = true;
+			} else {
+				p.send(int(bytesWritten));
+			}
+		} catch (Error& e) {
+			p.sendError(e);
+			failed = true;
+		} catch (...) {
+			p.sendError(unknown_error());
+			failed = true;
+		}
+		if (failed) {
+			// Since there was an error, sent's value can't be used to infer that the buffer has data and the limit is positive so check explicitly.
+			ASSERT(limit > 0);
+			bool notEmpty = false;
+			for(auto p = data; p; p = p->next)
+				if(p->bytes_written - p->bytes_sent > 0) {
+					notEmpty = true;
+					break;
+				}
+			ASSERT(notEmpty);
+			closeSocket();
+			p.sendError(connection_failed());
+		}
+	}
+};
 
 class Connection final : public IConnection, ReferenceCounted<Connection> {
 public:
@@ -453,6 +510,14 @@ public:
 
 		ASSERT( sent );  // Make sure data was sent, and also this check will fail if the buffer chain was empty or the limit was not > 0.
 		return sent;
+	}
+
+	Future<int> asyncWrite( SendBuffer const* data, int limit ) override {
+		++g_net2->countWrites;
+		auto p = WritePromise("N2_AsyncWriteError", id, data, limit, boost::bind(&Connection::closeSocket, this));
+		auto res = p.getFuture();
+		socket.async_write_some(boost::iterator_range<SendBufferIterator>(SendBufferIterator(data, limit), SendBufferIterator()), std::move(p));
+		return res;
 	}
 
 	NetworkAddress getPeerAddress() const override { return peer_address; }
@@ -1031,6 +1096,24 @@ public:
 
 		ASSERT( sent );  // Make sure data was sent, and also this check will fail if the buffer chain was empty or the limit was not > 0.
 		return sent;
+	}
+
+	Future<int> asyncWrite( SendBuffer const* data, int limit ) override {
+#ifdef __APPLE__
+		// For some reason, writing ssl_sock with more than 2016 bytes when socket is writeable sometimes results in a broken pipe error.
+		limit = std::min(limit, 2016);
+#endif
+		++g_net2->countWrites;
+		auto p = WritePromise("N2_AsyncWriteError", id, data, limit, boost::bind(&SSLConnection::closeSocket, this));
+		auto res = p.getFuture();
+		ssl_sock.async_write_some(boost::iterator_range<SendBufferIterator>(SendBufferIterator(data, limit), SendBufferIterator()), std::move(p));
+		return fmap(
+		    [](int sent) {
+				ASSERT( sent );  // Make sure data was sent, and also this check will fail if the buffer chain was empty or the limit was not > 0.
+			    g_net2->udpBytesReceived += sent;
+			    return sent;
+		    },
+		    res);
 	}
 
 	NetworkAddress getPeerAddress() const override { return peer_address; }

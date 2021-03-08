@@ -46,6 +46,7 @@ public:
 	Future<Void> onReadable() override;
 	int read(uint8_t* begin, uint8_t* end) override;
 	int write(SendBuffer const* buffer, int limit) override;
+	Future<int> asyncWrite(SendBuffer const* buffer, int limit) override;
 	NetworkAddress getPeerAddress() const override;
 	UID getDebugID() const override;
 	static Future<std::vector<NetworkAddress>> resolveTCPEndpoint(const std::string& host, const std::string& service);
