@@ -22,8 +22,10 @@
 #include "boost/asio/ip/address.hpp"
 #include "boost/system/system_error.hpp"
 #include "flow/Platform.h"
+#include "flow/SpscFragmentedArrayQueue.h"
 #include "flow/Trace.h"
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #define BOOST_SYSTEM_NO_LIB
 #define BOOST_DATE_TIME_NO_LIB
@@ -116,6 +118,7 @@ struct OrderedTask {
 	int64_t priority;
 	TaskPriority taskID;
 	Task *task;
+	OrderedTask() = default;
 	OrderedTask(int64_t priority, TaskPriority taskID, Task* task) : priority(priority), taskID(taskID), task(task) {}
 	bool operator < (OrderedTask const& rhs) const { return priority < rhs.priority; }
 };
@@ -225,7 +228,13 @@ public:
 	NetworkMetrics::PriorityStats* lastPriorityStats;
 
 	ReadyQueue<OrderedTask> ready;
-	ThreadSafeQueue<OrderedTask> threadReady;
+	// ThreadSafeQueue<OrderedTask> threadReady;
+	struct q_holder {
+       SpscFragmentedArrayQueue<OrderedTask> q;
+       std::atomic<q_holder*> next;
+    };
+    std::atomic<q_holder*> qs;
+    std::atomic_bool sleeping;
 
 	struct DelayedTask : OrderedTask {
 		double at;
@@ -236,11 +245,13 @@ public:
 
 	void checkForSlowTask(int64_t tscBegin, int64_t tscEnd, double duration, TaskPriority priority);
 	bool check_yield(TaskPriority taskId, int64_t tscNow);
-	void processThreadReady();
+	int processThreadReady();
 	void trackAtPriority( TaskPriority priority, double now );
 	void stopImmediately() {
 		stopped=true; decltype(ready) _1; ready.swap(_1); decltype(timers) _2; timers.swap(_2);
 	}
+
+	SpscFragmentedArrayQueue<OrderedTask>& ensureQ();
 
 	Future<Void> timeOffsetLogger;
 	Future<Void> logTimeOffset();
@@ -1386,11 +1397,14 @@ void Net2::run() {
 		}
 
 		double sleepTime = 0;
-		bool b = ready.empty();
+		bool b = ready.empty() && processThreadReady() == 0;
 		if (b) {
-			b = threadReady.canSleep();
-			if (!b) ++countCantSleep;
-		} else
+			sleeping.store(true, std::memory_order_release);
+			b = processThreadReady() == 0;
+			if (!b) {
+				++countCantSleep;
+			}
+		} else 
 			++countWontSleep;
 		if (b) {
 			sleepTime = 1e99;
@@ -1411,6 +1425,8 @@ void Net2::run() {
 				awakeMetric = true;
 			}
 		}
+
+		sleeping.store(false, std::memory_order_release);
 
 		tscBegin = timestampCounter();
 		taskBegin = timer_monotonic();
@@ -1436,8 +1452,6 @@ void Net2::run() {
 		}
 		countTimers += numTimers;
 		FDB_TRACE_PROBE(run_loop_ready_timers, numTimers);
-
-		processThreadReady();
 
 		tscBegin = timestampCounter();
 		tscEnd = tscBegin + FLOW_KNOBS->TSC_YIELD_TIME;
@@ -1580,17 +1594,19 @@ void Net2::trackAtPriority( TaskPriority priority, double now ) {
 	}
 }
 
-void Net2::processThreadReady() {
+int Net2::processThreadReady() {
 	int numReady = 0;
-	while (true) {
-		Optional<OrderedTask> t = threadReady.pop();
-		if (!t.present()) break;
-		t.get().priority -= ++tasksIssued;
-		ASSERT( t.get().task != 0 );
-		ready.push( t.get() );
-		++numReady;
+	auto qh = qs.load(std::memory_order_relaxed);
+	while (qh != nullptr) {
+		numReady += qh->q.pop([this] (OrderedTask&& t) {
+			t.priority -= ++tasksIssued;	
+			ASSERT( t.task != 0 );
+			ready.push( std::move(t) );
+		});
+		qh = qh->next.load(std::memory_order_relaxed);
 	}
 	FDB_TRACE_PROBE(run_loop_thread_ready, numReady);
+	return numReady;
 }
 
 void Net2::checkForSlowTask(int64_t tscBegin, int64_t tscEnd, double duration, TaskPriority priority) {
@@ -1680,6 +1696,16 @@ Future<Void> Net2::delay( double seconds, TaskPriority taskId ) {
 	return t->promise.getFuture();
 }
 
+SpscFragmentedArrayQueue<OrderedTask>& Net2::ensureQ() {
+	static thread_local q_holder* holder;
+	if (holder == nullptr) {
+		holder = new q_holder { SpscFragmentedArrayQueue<OrderedTask>(4096), nullptr };
+		auto cur = qs.exchange(holder);
+		holder->next.store(cur, std::memory_order_relaxed);
+	}
+	return holder->q;
+}
+
 void Net2::onMainThread(Promise<Void>&& signal, TaskPriority taskID) {
 	if (stopped) return;
 	PromiseTask* p = new PromiseTask( std::move(signal) );
@@ -1690,7 +1716,9 @@ void Net2::onMainThread(Promise<Void>&& signal, TaskPriority taskID) {
 		processThreadReady();
 		this->ready.push( OrderedTask( priority-(++tasksIssued), taskID, p ) );
 	} else {
-		if (threadReady.push( OrderedTask( priority, taskID, p ) ))
+		//if (threadReady.push( OrderedTask( priority, taskID, p ) ))
+		ensureQ().push( OrderedTask( priority, taskID, p ) );
+		if ( sleeping.load(std::memory_order_acquire) )
 			reactor.wake();
 	}
 }

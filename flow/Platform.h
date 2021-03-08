@@ -105,6 +105,15 @@
 #endif
 #endif
 
+static constexpr size_t CACHE_LINE_SIZE =
+#if defined(__x86_64__) || defined(__i386__)
+    64;
+#elif defined(__aarch64__)
+    128;
+#else
+    64;
+#endif
+
 #ifdef __unixish__
 #include <pthread.h>
 #define CRITICAL_SECTION pthread_mutex_t
